@@ -4,7 +4,7 @@ Projeto de estudo de engenharia de dados que implementa uma arquitetura Lakehous
 
 O escopo deste documento termina na disponibilização dos assets Gold. A construção de Metric Views, integração com Power BI e configuração do Genie compõem a etapa semântica posterior.
 
-![Arquitetura do projeto](./nyc-taxi-gold-architecture.png)
+![Arquitetura do projeto](./Project%20Architecture.png)
 
 ## Objetivos de engenharia
 
