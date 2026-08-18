@@ -9,6 +9,8 @@ Default upstream assets:
     nyc_taxi.silver.silver_taxi_zone_lookup
 
 The pipeline publishes seven conformed dimensions and one trip-grain fact.
+The fact consumes the Silver v2 quality and eligibility contract without
+reclassifying records that have already passed critical Silver validation.
 """
 
 from pyspark import pipelines as dp
@@ -24,14 +26,7 @@ ZONE_SOURCE_TABLE = spark.conf.get(
     "nyc_taxi.gold.zone_source_table",
     "nyc_taxi.silver.silver_taxi_zone_lookup",
 )
-CALENDAR_START_DATE = spark.conf.get(
-    "nyc_taxi.gold.calendar_start_date",
-    "2025-01-01",
-)
-CALENDAR_END_DATE = spark.conf.get(
-    "nyc_taxi.gold.calendar_end_date",
-    "2025-12-31",
-)
+SILVER_QUALITY_RULE_VERSION = "2.0"
 
 
 MONTH_NAMES = [
@@ -59,19 +54,86 @@ DAY_NAMES = [
     "Sunday",
 ]
 
-US_FEDERAL_HOLIDAYS_2025 = [
-    ("2025-01-01", "New Year's Day"),
-    ("2025-01-20", "Martin Luther King Jr. Day"),
-    ("2025-02-17", "Washington's Birthday"),
-    ("2025-05-26", "Memorial Day"),
-    ("2025-06-19", "Juneteenth National Independence Day"),
-    ("2025-07-04", "Independence Day"),
-    ("2025-09-01", "Labor Day"),
-    ("2025-10-13", "Columbus Day"),
-    ("2025-11-11", "Veterans Day"),
-    ("2025-11-27", "Thanksgiving Day"),
-    ("2025-12-25", "Christmas Day"),
-]
+SILVER_SOURCE_EXPECTATIONS = {
+    "source_record_hash_present": (
+        "source_record_hash IS NOT NULL"
+    ),
+    "source_record_is_not_quarantined": (
+        "is_quarantined = false"
+    ),
+    "source_has_no_critical_reason": (
+        "size(critical_quality_reasons) = 0"
+    ),
+    "source_trip_volume_is_eligible": (
+        "is_trip_volume_metric_eligible = true"
+    ),
+    "source_recorded_amount_is_eligible": (
+        "is_recorded_amount_metric_eligible = true"
+    ),
+    "source_route_is_eligible": (
+        "is_route_metric_eligible = true"
+    ),
+    "source_quality_rule_is_supported": (
+        "quality_rule_version = "
+        f"'{SILVER_QUALITY_RULE_VERSION}'"
+    ),
+}
+
+
+DIM_DATE_EXPECTATIONS = {
+    "date_member_is_known_or_unknown": (
+        "(date_key = 0 AND full_date IS NULL) "
+        "OR (date_key > 0 AND full_date IS NOT NULL)"
+    ),
+    "known_date_key_matches_date": (
+        "date_key = 0 OR date_key = "
+        "CAST(date_format(full_date, 'yyyyMMdd') AS INT)"
+    ),
+    "calendar_year_role_is_valid": (
+        "calendar_year_role IN ("
+        "'PREDECESSOR_YEAR', "
+        "'SOURCE_YEAR_RANGE', "
+        "'SUCCESSOR_YEAR', "
+        "'UNKNOWN')"
+    ),
+}
+
+
+FACT_EXPECTATIONS = {
+    "trip_key_present": "trip_key IS NOT NULL",
+    "pickup_date_resolved": "pickup_date_key > 0",
+    "dropoff_date_resolved": "dropoff_date_key > 0",
+    "pickup_time_resolved": "pickup_time_key >= 0",
+    "dropoff_time_resolved": "dropoff_time_key >= 0",
+    "pickup_zone_resolved": "pickup_zone_key > 0",
+    "dropoff_zone_resolved": "dropoff_zone_key > 0",
+    "trip_volume_is_eligible": (
+        "is_trip_volume_metric_eligible = true"
+    ),
+    "recorded_amount_is_eligible": (
+        "is_recorded_amount_metric_eligible = true"
+    ),
+    "route_is_eligible": "is_route_metric_eligible = true",
+    "warning_count_is_consistent": (
+        "dq_warning_count = size(dq_warning_reasons)"
+    ),
+    "eligibility_count_is_consistent": (
+        "eligibility_restriction_count = "
+        "size(eligibility_reasons)"
+    ),
+    "efficiency_eligibility_is_consistent": (
+        "is_efficiency_metric_eligible = ("
+        "is_distance_metric_eligible AND "
+        "is_duration_metric_eligible)"
+    ),
+    "ml_standard_trip_is_consistent": (
+        "is_ml_standard_trip_eligible = ("
+        "is_standard_operational_trip_eligible AND "
+        "is_passenger_metric_eligible AND "
+        "is_ml_financial_feature_eligible AND "
+        "is_ml_categorical_feature_eligible)"
+    ),
+}
 
 
 def _source_column(
@@ -104,13 +166,105 @@ def _source_column(
     return f.col(f"`{resolved_name}`").cast(data_type).alias(alias)
 
 
+def _silver_contract_column(
+    dataframe,
+    source_name,
+    alias,
+    data_type,
+):
+    """Resolve a required field from the consolidated Silver contract."""
+    return _source_column(
+        dataframe,
+        [source_name],
+        alias,
+        data_type,
+        required=True,
+    )
+
+
+def _us_federal_holiday_name(date_column):
+    """Return the federal-holiday name for any calendar year.
+
+    The rules identify the statutory holiday date. Observed weekdays are not
+    substituted when a fixed-date holiday falls on a weekend.
+    """
+    month_number = f.month(date_column)
+    day_number = f.dayofmonth(date_column)
+    weekday_number = f.dayofweek(date_column)
+
+    return (
+        f.when(
+            (month_number == 1) & (day_number == 1),
+            f.lit("New Year's Day"),
+        )
+        .when(
+            (month_number == 1)
+            & (weekday_number == 2)
+            & day_number.between(15, 21),
+            f.lit("Martin Luther King Jr. Day"),
+        )
+        .when(
+            (month_number == 2)
+            & (weekday_number == 2)
+            & day_number.between(15, 21),
+            f.lit("Washington's Birthday"),
+        )
+        .when(
+            (month_number == 5)
+            & (weekday_number == 2)
+            & day_number.between(25, 31),
+            f.lit("Memorial Day"),
+        )
+        .when(
+            (month_number == 6) & (day_number == 19),
+            f.lit("Juneteenth National Independence Day"),
+        )
+        .when(
+            (month_number == 7) & (day_number == 4),
+            f.lit("Independence Day"),
+        )
+        .when(
+            (month_number == 9)
+            & (weekday_number == 2)
+            & day_number.between(1, 7),
+            f.lit("Labor Day"),
+        )
+        .when(
+            (month_number == 10)
+            & (weekday_number == 2)
+            & day_number.between(8, 14),
+            f.lit("Columbus Day"),
+        )
+        .when(
+            (month_number == 11) & (day_number == 11),
+            f.lit("Veterans Day"),
+        )
+        .when(
+            (month_number == 11)
+            & (weekday_number == 5)
+            & day_number.between(22, 28),
+            f.lit("Thanksgiving Day"),
+        )
+        .when(
+            (month_number == 12) & (day_number == 25),
+            f.lit("Christmas Day"),
+        )
+    )
+
+
 @dp.temporary_view(name="gold_trip_source")
+@dp.expect_all_or_fail(SILVER_SOURCE_EXPECTATIONS)
 def gold_trip_source():
-    """Canonical projection of the validated Silver trip asset."""
+    """Canonical projection of the validated Silver v2 trip asset."""
     source = spark.read.table(TRIP_SOURCE_TABLE)
 
     return source.select(
-        _source_column(source, ["vendor_id", "VendorID"], "vendor_id", "int"),
+        _source_column(
+            source,
+            ["vendor_id", "VendorID"],
+            "vendor_id",
+            "int",
+        ),
         _source_column(
             source,
             ["pickup_datetime", "tpep_pickup_datetime"],
@@ -128,27 +282,30 @@ def gold_trip_source():
             ["passenger_count"],
             "passenger_count",
             "int",
-            required=False,
         ),
         _source_column(
             source,
             ["trip_distance_miles", "trip_distance"],
             "trip_distance_miles",
-            "decimal(12,3)",
+            "decimal(18,3)",
+        ),
+        _silver_contract_column(
+            source,
+            "trip_duration_minutes",
+            "trip_duration_minutes",
+            "decimal(12,2)",
         ),
         _source_column(
             source,
             ["rate_code_id", "ratecode_id", "RatecodeID"],
             "rate_code_id",
             "int",
-            required=False,
         ),
         _source_column(
             source,
-            ["store_and_fwd_flag"],
+            ["store_and_fwd_flag", "store_and_forward_flag"],
             "store_and_fwd_flag",
             "string",
-            required=False,
         ),
         _source_column(
             source,
@@ -167,74 +324,297 @@ def gold_trip_source():
             ["payment_type_id", "payment_type"],
             "payment_type_id",
             "int",
-            required=False,
         ),
-        _source_column(source, ["fare_amount"], "fare_amount", "decimal(18,2)"),
+        _source_column(
+            source,
+            ["fare_amount"],
+            "fare_amount",
+            "decimal(18,2)",
+        ),
         _source_column(
             source,
             ["extra_amount", "extra"],
             "extra_amount",
             "decimal(18,2)",
-            required=False,
-            default_value=0,
         ),
         _source_column(
             source,
             ["mta_tax_amount", "mta_tax"],
             "mta_tax_amount",
             "decimal(18,2)",
-            required=False,
-            default_value=0,
         ),
-        _source_column(source, ["tip_amount"], "tip_amount", "decimal(18,2)"),
+        _source_column(
+            source,
+            ["tip_amount"],
+            "tip_amount",
+            "decimal(18,2)",
+        ),
         _source_column(
             source,
             ["tolls_amount"],
             "tolls_amount",
             "decimal(18,2)",
-            required=False,
-            default_value=0,
         ),
         _source_column(
             source,
             ["improvement_surcharge_amount", "improvement_surcharge"],
             "improvement_surcharge_amount",
             "decimal(18,2)",
-            required=False,
-            default_value=0,
         ),
-        _source_column(source, ["total_amount"], "total_amount", "decimal(18,2)"),
+        _source_column(
+            source,
+            ["total_amount"],
+            "total_amount",
+            "decimal(18,2)",
+        ),
         _source_column(
             source,
             ["congestion_surcharge_amount", "congestion_surcharge"],
             "congestion_surcharge_amount",
             "decimal(18,2)",
-            required=False,
-            default_value=0,
         ),
         _source_column(
             source,
             ["airport_fee_amount", "airport_fee", "Airport_fee"],
             "airport_fee_amount",
             "decimal(18,2)",
-            required=False,
-            default_value=0,
         ),
         _source_column(
             source,
             ["cbd_congestion_fee_amount", "cbd_congestion_fee"],
             "cbd_congestion_fee_amount",
             "decimal(18,2)",
-            required=False,
-            default_value=0,
         ),
         _source_column(
             source,
             ["record_hash", "trip_record_hash"],
             "source_record_hash",
             "string",
-            required=False,
         ),
+        _source_column(
+            source,
+            ["source_year"],
+            "source_year",
+            "int",
+        ),
+        _source_column(
+            source,
+            ["source_month"],
+            "source_month",
+            "int",
+        ),
+        _silver_contract_column(
+            source,
+            "_financial_component_amount",
+            "financial_component_amount",
+            "decimal(20,2)",
+        ),
+        _silver_contract_column(
+            source,
+            "_financial_reconciliation_difference",
+            "financial_reconciliation_difference",
+            "decimal(20,2)",
+        ),
+        _silver_contract_column(
+            source,
+            "_dq_reasons",
+            "critical_quality_reasons",
+            "array<string>",
+        ),
+        _silver_contract_column(
+            source,
+            "_dq_warning_reasons",
+            "dq_warning_reasons",
+            "array<string>",
+        ),
+        _silver_contract_column(
+            source,
+            "_dq_warning_count",
+            "dq_warning_count",
+            "int",
+        ),
+        _silver_contract_column(
+            source,
+            "_has_dq_warnings",
+            "has_dq_warnings",
+            "boolean",
+        ),
+        _silver_contract_column(
+            source,
+            "_passenger_data_status",
+            "passenger_data_status",
+            "string",
+        ),
+        _silver_contract_column(
+            source,
+            "_distance_data_status",
+            "distance_data_status",
+            "string",
+        ),
+        _silver_contract_column(
+            source,
+            "_financial_record_type",
+            "financial_record_type",
+            "string",
+        ),
+        _silver_contract_column(
+            source,
+            "_eligibility_reasons",
+            "eligibility_reasons",
+            "array<string>",
+        ),
+        _silver_contract_column(
+            source,
+            "_eligibility_restriction_count",
+            "eligibility_restriction_count",
+            "int",
+        ),
+        _silver_contract_column(
+            source,
+            "_eligibility_status",
+            "eligibility_status",
+            "string",
+        ),
+        _silver_contract_column(
+            source,
+            "_quality_rule_version",
+            "quality_rule_version",
+            "string",
+        ),
+        _silver_contract_column(
+            source,
+            "_silver_refresh_timestamp",
+            "silver_refresh_timestamp",
+            "timestamp",
+        ),
+        _silver_contract_column(
+            source,
+            "_eligibility_refresh_timestamp",
+            "eligibility_refresh_timestamp",
+            "timestamp",
+        ),
+        *[
+            _silver_contract_column(
+                source,
+                source_name,
+                alias,
+                "boolean",
+            )
+            for source_name, alias in [
+                ("_is_quarantined", "is_quarantined"),
+                ("_is_flex_fare", "is_flex_fare"),
+                ("_is_zero_distance", "is_zero_distance"),
+                (
+                    "_is_passenger_count_missing",
+                    "is_passenger_count_missing",
+                ),
+                (
+                    "_is_zero_passenger_count",
+                    "is_zero_passenger_count",
+                ),
+                (
+                    "_is_financially_unreconciled",
+                    "is_financially_unreconciled",
+                ),
+                (
+                    "_is_negative_total_amount",
+                    "is_negative_total_amount",
+                ),
+                (
+                    "_has_negative_financial_component",
+                    "has_negative_financial_component",
+                ),
+                ("_is_cross_year_trip", "is_cross_year_trip"),
+                (
+                    "_is_trip_volume_metric_eligible",
+                    "is_trip_volume_metric_eligible",
+                ),
+                (
+                    "_is_passenger_metric_eligible",
+                    "is_passenger_metric_eligible",
+                ),
+                (
+                    "_is_distance_metric_eligible",
+                    "is_distance_metric_eligible",
+                ),
+                (
+                    "_is_duration_metric_eligible",
+                    "is_duration_metric_eligible",
+                ),
+                (
+                    "_is_efficiency_metric_eligible",
+                    "is_efficiency_metric_eligible",
+                ),
+                (
+                    "_is_efficiency_kpi_eligible",
+                    "is_efficiency_kpi_eligible",
+                ),
+                (
+                    "_is_recorded_amount_metric_eligible",
+                    "is_recorded_amount_metric_eligible",
+                ),
+                (
+                    "_is_financial_breakdown_metric_eligible",
+                    "is_financial_breakdown_metric_eligible",
+                ),
+                (
+                    "_is_reported_tip_metric_eligible",
+                    "is_reported_tip_metric_eligible",
+                ),
+                (
+                    "_is_rate_code_metric_eligible",
+                    "is_rate_code_metric_eligible",
+                ),
+                (
+                    "_is_vendor_metric_eligible",
+                    "is_vendor_metric_eligible",
+                ),
+                (
+                    "_is_payment_type_metric_eligible",
+                    "is_payment_type_metric_eligible",
+                ),
+                (
+                    "_is_route_metric_eligible",
+                    "is_route_metric_eligible",
+                ),
+                (
+                    "_is_reversal_or_adjustment",
+                    "is_reversal_or_adjustment",
+                ),
+                (
+                    "_is_standard_operational_trip_eligible",
+                    "is_standard_operational_trip_eligible",
+                ),
+                (
+                    "_is_ml_distance_feature_eligible",
+                    "is_ml_distance_feature_eligible",
+                ),
+                (
+                    "_is_ml_passenger_feature_eligible",
+                    "is_ml_passenger_feature_eligible",
+                ),
+                (
+                    "_is_ml_financial_feature_eligible",
+                    "is_ml_financial_feature_eligible",
+                ),
+                (
+                    "_is_ml_categorical_feature_eligible",
+                    "is_ml_categorical_feature_eligible",
+                ),
+                (
+                    "_is_ml_standard_trip_eligible",
+                    "is_ml_standard_trip_eligible",
+                ),
+                (
+                    "_requires_data_review",
+                    "requires_data_review",
+                ),
+                (
+                    "_requires_gold_date_extension",
+                    "requires_gold_date_extension",
+                ),
+            ]
+        ],
     )
 
 
@@ -268,35 +648,85 @@ def gold_zone_source():
 
 @dp.materialized_view(
     name="dim_date",
-    comment="Calendar dimension at day grain for the 2025 NYC Yellow Taxi study.",
+    comment=(
+        "Data-driven calendar at day grain. It includes the complete year "
+        "before the minimum trip year and the complete year after the "
+        "maximum trip year."
+    ),
     table_properties={"quality": "gold", "data_product": "yellow_taxi_business"},
 )
+@dp.expect_all_or_fail(DIM_DATE_EXPECTATIONS)
 def dim_date():
-    holiday_rows = spark.createDataFrame(
-        US_FEDERAL_HOLIDAYS_2025,
-        "holiday_date_string string, holiday_name string",
-    ).select(
-        f.to_date("holiday_date_string").alias("holiday_date"),
-        "holiday_name",
+    date_bounds = (
+        spark.read.table("gold_trip_source")
+        .agg(
+            f.min(f.to_date("pickup_datetime")).alias(
+                "minimum_pickup_date"
+            ),
+            f.min(f.to_date("dropoff_datetime")).alias(
+                "minimum_dropoff_date"
+            ),
+            f.max(f.to_date("pickup_datetime")).alias(
+                "maximum_pickup_date"
+            ),
+            f.max(f.to_date("dropoff_datetime")).alias(
+                "maximum_dropoff_date"
+            ),
+        )
+        .select(
+            f.least(
+                "minimum_pickup_date",
+                "minimum_dropoff_date",
+            ).alias("minimum_source_date"),
+            f.greatest(
+                "maximum_pickup_date",
+                "maximum_dropoff_date",
+            ).alias("maximum_source_date"),
+        )
+        .withColumn(
+            "minimum_source_year",
+            f.year("minimum_source_date"),
+        )
+        .withColumn(
+            "maximum_source_year",
+            f.year("maximum_source_date"),
+        )
+        .withColumn(
+            "calendar_start_date",
+            f.make_date(
+                f.col("minimum_source_year") - f.lit(1),
+                f.lit(1),
+                f.lit(1),
+            ),
+        )
+        .withColumn(
+            "calendar_end_date",
+            f.make_date(
+                f.col("maximum_source_year") + f.lit(1),
+                f.lit(12),
+                f.lit(31),
+            ),
+        )
     )
 
-    calendar = spark.range(1).select(
+    calendar = date_bounds.select(
+        "minimum_source_year",
+        "maximum_source_year",
         f.explode(
             f.sequence(
-                f.to_date(f.lit(CALENDAR_START_DATE)),
-                f.to_date(f.lit(CALENDAR_END_DATE)),
+                "calendar_start_date",
+                "calendar_end_date",
             )
-        ).alias("full_date")
+        ).alias("full_date"),
     )
 
     day_of_week_number = (
         f.pmod(f.dayofweek("full_date") + f.lit(5), f.lit(7)) + f.lit(1)
     ).cast("int")
 
-    dated = calendar.join(
-        holiday_rows,
-        calendar.full_date == holiday_rows.holiday_date,
-        "left",
+    dated = calendar.withColumn(
+        "holiday_name",
+        _us_federal_holiday_name(f.col("full_date")),
     )
 
     dimension = dated.select(
@@ -331,6 +761,22 @@ def dim_date():
         (
             (~day_of_week_number.isin(6, 7)) & f.col("holiday_name").isNull()
         ).alias("is_business_day"),
+        f.when(
+            f.year("full_date") < f.col("minimum_source_year"),
+            f.lit("PREDECESSOR_YEAR"),
+        )
+        .when(
+            f.year("full_date") > f.col("maximum_source_year"),
+            f.lit("SUCCESSOR_YEAR"),
+        )
+        .otherwise(f.lit("SOURCE_YEAR_RANGE"))
+        .alias("calendar_year_role"),
+        f.year("full_date")
+        .between(
+            f.col("minimum_source_year"),
+            f.col("maximum_source_year"),
+        )
+        .alias("is_source_year"),
     )
 
     unknown = spark.range(1).select(
@@ -353,6 +799,8 @@ def dim_date():
         f.lit(False).alias("is_federal_holiday"),
         f.lit(None).cast("string").alias("holiday_scope"),
         f.lit(False).alias("is_business_day"),
+        f.lit("UNKNOWN").alias("calendar_year_role"),
+        f.lit(False).alias("is_source_year"),
     )
 
     return dimension.unionByName(unknown)
@@ -512,7 +960,7 @@ def dim_rate_code():
 
 @dp.materialized_view(
     name="dim_vendor",
-    comment="TPEP providers from the 2025 TLC Yellow Taxi data dictionary.",
+    comment="TPEP providers from the TLC Yellow Taxi data dictionary.",
     table_properties={"quality": "gold", "data_product": "yellow_taxi_business"},
 )
 def dim_vendor():
@@ -535,12 +983,14 @@ def dim_vendor():
 @dp.materialized_view(
     name="fact_yellow_taxi_trip",
     comment=(
-        "One row per validated Yellow Taxi trip. Financial amounts are passenger "
-        "charges reported by TLC, not net revenue or profit."
+        "One row per Silver-validated Yellow Taxi trip, including quality and "
+        "eligibility contracts. Financial amounts are passenger charges "
+        "reported by TLC, not net revenue or profit."
     ),
     table_properties={"quality": "gold", "data_product": "yellow_taxi_business"},
     cluster_by=["pickup_date_key", "pickup_zone_key"],
 )
+@dp.expect_all_or_fail(FACT_EXPECTATIONS)
 def fact_yellow_taxi_trip():
     trips = (
         spark.read.table("gold_trip_source")
@@ -548,29 +998,6 @@ def fact_yellow_taxi_trip():
         .withColumn("_dropoff_date", f.to_date("dropoff_datetime"))
         .withColumn("_pickup_hour", f.hour("pickup_datetime"))
         .withColumn("_dropoff_hour", f.hour("dropoff_datetime"))
-        .withColumn(
-            "_computed_trip_hash",
-            f.sha2(
-                f.concat_ws(
-                    "||",
-                    *[
-                        f.coalesce(f.col(column_name).cast("string"), f.lit("<null>"))
-                        for column_name in [
-                            "vendor_id",
-                            "pickup_datetime",
-                            "dropoff_datetime",
-                            "pickup_location_id",
-                            "dropoff_location_id",
-                            "passenger_count",
-                            "trip_distance_miles",
-                            "fare_amount",
-                            "total_amount",
-                        ]
-                    ],
-                ),
-                256,
-            ),
-        )
         .alias("trip")
     )
 
@@ -687,27 +1114,73 @@ def fact_yellow_taxi_trip():
         "int"
     )
     vendor_key = f.coalesce(f.col("vendor.vendor_key"), f.lit(-1)).cast("int")
-    trip_duration_minutes = (
-        (
-            f.col("trip.dropoff_datetime").cast("long")
-            - f.col("trip.pickup_datetime").cast("long")
-        )
-        / f.lit(60.0)
-    ).cast("decimal(12,2)")
     airport_trip_code = f.coalesce(
         f.col("pickup_zone.pickup_airport_code"),
         f.col("dropoff_zone.dropoff_airport_code"),
         f.col("rate.rate_airport_code"),
     )
+    reported_card_tip_is_supported = (
+        (f.col("trip.payment_type_id") == f.lit(1))
+        & f.col("trip.is_reported_tip_metric_eligible")
+    )
+
+    descriptive_quality_columns = (
+        "passenger_data_status",
+        "distance_data_status",
+        "financial_record_type",
+        "dq_warning_reasons",
+        "dq_warning_count",
+        "has_dq_warnings",
+        "eligibility_reasons",
+        "eligibility_restriction_count",
+        "eligibility_status",
+        "quality_rule_version",
+        "silver_refresh_timestamp",
+        "eligibility_refresh_timestamp",
+    )
+
+    diagnostic_flag_columns = (
+        "is_flex_fare",
+        "is_zero_distance",
+        "is_passenger_count_missing",
+        "is_zero_passenger_count",
+        "is_financially_unreconciled",
+        "is_negative_total_amount",
+        "has_negative_financial_component",
+        "is_cross_year_trip",
+        "is_reversal_or_adjustment",
+        "requires_data_review",
+        "requires_gold_date_extension",
+    )
+
+    metric_eligibility_columns = (
+        "is_trip_volume_metric_eligible",
+        "is_passenger_metric_eligible",
+        "is_distance_metric_eligible",
+        "is_duration_metric_eligible",
+        "is_efficiency_metric_eligible",
+        "is_efficiency_kpi_eligible",
+        "is_recorded_amount_metric_eligible",
+        "is_financial_breakdown_metric_eligible",
+        "is_reported_tip_metric_eligible",
+        "is_rate_code_metric_eligible",
+        "is_vendor_metric_eligible",
+        "is_payment_type_metric_eligible",
+        "is_route_metric_eligible",
+    )
+
+    ml_eligibility_columns = (
+        "is_standard_operational_trip_eligible",
+        "is_ml_distance_feature_eligible",
+        "is_ml_passenger_feature_eligible",
+        "is_ml_financial_feature_eligible",
+        "is_ml_categorical_feature_eligible",
+        "is_ml_standard_trip_eligible",
+    )
 
     return joined.select(
-        f.when(
-            f.col("trip.source_record_hash").isNotNull()
-            & (f.length(f.trim(f.col("trip.source_record_hash"))) > 0),
-            f.col("trip.source_record_hash"),
-        )
-        .otherwise(f.col("trip._computed_trip_hash"))
-        .alias("trip_key"),
+        f.col("trip.source_record_hash").alias("trip_key"),
+        f.col("trip.source_record_hash"),
         pickup_date_key.alias("pickup_date_key"),
         dropoff_date_key.alias("dropoff_date_key"),
         pickup_time_key.alias("pickup_time_key"),
@@ -724,41 +1197,22 @@ def fact_yellow_taxi_trip():
         f.col("trip.dropoff_datetime"),
         f.col("trip.passenger_count"),
         f.col("trip.trip_distance_miles"),
-        trip_duration_minutes.alias("trip_duration_minutes"),
-        f.coalesce(f.col("trip.fare_amount"), f.lit(0).cast("decimal(18,2)")).alias(
-            "fare_amount"
-        ),
-        f.coalesce(f.col("trip.extra_amount"), f.lit(0).cast("decimal(18,2)")).alias(
-            "extra_amount"
-        ),
-        f.coalesce(
-            f.col("trip.mta_tax_amount"), f.lit(0).cast("decimal(18,2)")
-        ).alias("mta_tax_amount"),
-        f.coalesce(f.col("trip.tip_amount"), f.lit(0).cast("decimal(18,2)")).alias(
-            "tip_amount"
-        ),
-        f.coalesce(
-            f.col("trip.tolls_amount"), f.lit(0).cast("decimal(18,2)")
-        ).alias("tolls_amount"),
-        f.coalesce(
-            f.col("trip.improvement_surcharge_amount"),
-            f.lit(0).cast("decimal(18,2)"),
-        ).alias("improvement_surcharge_amount"),
-        f.coalesce(
-            f.col("trip.total_amount"), f.lit(0).cast("decimal(18,2)")
-        ).alias("total_amount"),
-        f.coalesce(
-            f.col("trip.congestion_surcharge_amount"),
-            f.lit(0).cast("decimal(18,2)"),
-        ).alias("congestion_surcharge_amount"),
-        f.coalesce(
-            f.col("trip.airport_fee_amount"), f.lit(0).cast("decimal(18,2)")
-        ).alias("airport_fee_amount"),
-        f.coalesce(
-            f.col("trip.cbd_congestion_fee_amount"),
-            f.lit(0).cast("decimal(18,2)"),
-        ).alias("cbd_congestion_fee_amount"),
+        f.col("trip.trip_duration_minutes"),
+        f.col("trip.fare_amount"),
+        f.col("trip.extra_amount"),
+        f.col("trip.mta_tax_amount"),
+        f.col("trip.tip_amount"),
+        f.col("trip.tolls_amount"),
+        f.col("trip.improvement_surcharge_amount"),
+        f.col("trip.total_amount"),
+        f.col("trip.congestion_surcharge_amount"),
+        f.col("trip.airport_fee_amount"),
+        f.col("trip.cbd_congestion_fee_amount"),
+        f.col("trip.financial_component_amount"),
+        f.col("trip.financial_reconciliation_difference"),
         f.lit(1).cast("long").alias("trip_count"),
+        f.col("trip.source_year"),
+        f.col("trip.source_month"),
         f.coalesce(
             f.upper(f.trim(f.col("trip.store_and_fwd_flag"))) == f.lit("Y"),
             f.lit(False),
@@ -766,13 +1220,32 @@ def fact_yellow_taxi_trip():
         airport_trip_code.isNotNull().alias("is_airport_trip"),
         airport_trip_code.alias("airport_trip_code"),
         f.coalesce(
-            (f.col("trip.payment_type_id") == 1)
-            & (f.coalesce(f.col("trip.tip_amount"), f.lit(0)) > 0),
+            f.when(
+                reported_card_tip_is_supported,
+                f.col("trip.tip_amount"),
+            ),
+            f.lit(0).cast("decimal(18,2)"),
+        ).alias("reported_card_tip_amount"),
+        f.coalesce(
+            reported_card_tip_is_supported
+            & (f.col("trip.tip_amount") > f.lit(0)),
             f.lit(False),
         ).alias("has_reported_electronic_tip"),
-        f.coalesce(
-            (f.col("trip.trip_distance_miles") > 0)
-            & (trip_duration_minutes > 0),
-            f.lit(False),
-        ).alias("is_efficiency_kpi_eligible"),
+        *[
+            f.col(f"trip.{column_name}")
+            for column_name in descriptive_quality_columns
+        ],
+        *[
+            f.col(f"trip.{column_name}")
+            for column_name in diagnostic_flag_columns
+        ],
+        *[
+            f.col(f"trip.{column_name}")
+            for column_name in metric_eligibility_columns
+        ],
+        *[
+            f.col(f"trip.{column_name}")
+            for column_name in ml_eligibility_columns
+        ],
+        f.current_timestamp().alias("gold_refresh_timestamp"),
     )
